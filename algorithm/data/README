@@ -1,0 +1,12 @@
+1. Princeton LBer
+ - svip : 128.112.255.98 (svip/)
+   Flowspace (avg 1min, npackets): niagara_bad_input.txt
+   ECMP: ecmp_bad.csv
+   Niagara: niagara_bad.csv
+
+ - cdf: top 20 (svip_cdf/)
+   Flowspace (avg 1min, npackets): vip_all52_4bits.txt
+   Niagara: niagara_vip_all52_4bits.txt
+   Result: vip_cmp52_4bits.txt
+
+2. WAN LBer

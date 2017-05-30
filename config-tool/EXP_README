@@ -1,0 +1,28 @@
+EXPERIMENT - BE & SW
+
+- ng-test.sh
+  . startservers on BEs (listening on ports)
+  . closeservers on BEs
+  . show the connection tracking on SWs
+  . remove the connection tracking on SWs
+
+EXPERIMENT - CLIENT
+
+- gen_one_conn.py
+  . Generate one iperf connection
+
+- gen_traffic_all.py
+  . Generate multiple iperf connections
+  . Built on top of gen_one_conn.py
+
+
+COLLECT DATA
+
+- monitor.py
+  . Running on BEs
+  . Monitor the traffic by retrieving ifconfig stats
+
+- collect.sh
+  . Run monitor
+  . Should run outside the ip netns
+

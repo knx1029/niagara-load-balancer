@@ -1,0 +1,14 @@
+1. rule_gen.py : RuleGenerator
+   - transform labeling between DB and algorithm input & output
+   - run algorithm
+
+2. rule_mgr.py : RuleManager
+   - Pull out the information of VIPs, Devices etc
+   - Call rule generation algorithm to generate abstract bit matching rules
+   - Translate bit matching rules to actual rules matching device class & type
+     + e.g., u32 iptable rules, of rules
+   - Store the abstract and actual rules to SQL
+
+3. rule_translator.py : RuleTranslator
+   - Translat abstract rules to a specific formatted rules that 
+     matchin on device's class and type

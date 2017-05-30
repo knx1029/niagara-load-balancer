@@ -1,0 +1,61 @@
+
+1. Setup
+
+# start controller program
+./startRyu.sh niagara_hswitch
+
+# create topology
+./startMN.sh
+
+# set ip on every host
+./ipHosts.sh $host_name
+
+# set controller bridge on every switch
+./brSwitches.sh
+
+# set ip on every switch
+./ipSwitches.sh
+
+# set ip route on every host
+./routeHosts.sh $host_name
+
+# set default gw on every switch
+./gwSwitches.sh
+
+# set route on every switch
+./routeSwitches.sh
+
+
+2. Niagara Experiment
+
+use exNgFull.sh
+
+# set up routing on s1 and s2
+# run on controller
+./exNgFull.sh rt
+
+# install niagara rules on hswitch
+# run on controller
+./exNgFull.sh ng
+
+# set up NAT on sswitch1 and sswitch2
+# run on both hosts' xterms
+./exNgFull.sh sswitch1
+./exNgFull.sh sswitch2
+
+# start server on server1 and server2
+# run on both hosts' xterms
+./exNgFull.sh sv
+
+# wget website
+# run the command on either client to verify the redirection
+./exNgFull.sh wget
+
+
+# clear up set up
+# run on controller
+./exNgFull.sh rm rt
+./exNgFull.sh rm ng
+# run on hosts' xterm
+./exNgFull.sh sswitch1
+./exNgFull.sh sswitch2

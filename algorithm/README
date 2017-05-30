@@ -1,0 +1,5 @@
+- vip_rule 
+  old rule algorithm which assumes perfect balance bits
+
+- rule_lib
+  new rule algorithm which accepts skewness of bit balance

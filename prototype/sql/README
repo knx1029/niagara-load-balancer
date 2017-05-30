@@ -1,0 +1,15 @@
+1. sql_wrapper.py : SQLWrapper
+   - Access MySQL database
+   - Translate function call to SQL clauses
+
+2. base_mgr.py : BaseManager
+   - Abstract class, which allow manage a bunch of tables
+
+3. dev_mgr.py : DeviceManager
+   - Global
+   - Manage the information of devices
+
+4. vip_mgr.py : VIPManager
+   - Global
+   - Manage the information of VIPs: weights, traffic
+

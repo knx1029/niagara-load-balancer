@@ -1,0 +1,86 @@
+This folder contains the source code to run a Niagara OpenFlow controller in both Pica8 switch and Mininet.
+
+.\
+
+- controller.py
+  provides REST API
+
+- ecmp_router.py
+  a single router for a switch
+
+- info.py
+  routing table, ecmp policy and flow group 
+
+- OfCtl.py
+  openflow speaking
+
+- utils.py
+  constant variables
+
+- startRyu.sh
+  start the ryu manager
+
+
+
+analysis\
+
+- plot.py
+  plot a single graph
+
+- visualize.py
+  plot for multiple graphs
+
+- runVisualize.sh
+  call visualize.py
+
+- analyze.py
+  query the of_table stats
+
+- runQuery.sh
+  periodic run of analysis
+
+
+
+
+topo\
+
+- startMN.sh
+  calls HwTopo to create Mininet;also can start iperf server and iperf clients
+
+- HwTopo.py
+  creates an Mininet topology for Niagara test. 
+
+- config.sh
+  all the commands use to configure niagara controller is here
+  It is also called by HwTopo.py to initialize Mininet
+
+
+
+sns\
+
+- upload.sh
+  it copies monitor result from mininet to public html
+
+testbed\
+
+
+
+
+INSTRUCTIONS:
+
+To do a complete experiment with Mininet.
+
+0. Start controller
+@mininte$ ./startRyu.sh ecmp_router
+
+1. Create Mininet topology
+@mininet$ ./topo/startMN.sh -t
+
+2. Start the visualization
+@mininet$ ./analysis/runQuery.sh
+@VM-host$ ./sns/upload.sh
+@VisualizeServer$ ./analysis/runVisualize.sh
+
+4. Start iperf server and clients
+mininet> py net.iperf_server()
+mininet> py net.iperf_client() 

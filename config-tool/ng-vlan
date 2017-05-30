@@ -1,0 +1,1122 @@
+#!/usr/bin/perl
+# ng-vlan
+# 
+# author: reumann@google.com
+# (c) 2013 Google Inc.
+
+# TODO:
+# 1. set the vip version on sw
+
+
+#del or add
+my $command = $ARGV[0];  
+my $if_name = $ARGV[1];
+my $vlan_id = $ARGV[2];
+# optional  (defaults to eth0's address)
+my $addr_arg = $ARGV[3]; 
+my $addr_arg2 = $ARGV[4]; 
+
+sub get_vlan_ifname {
+  my $interface = shift @_;
+  my $tag = shift @_;
+  my $ifname = sprintf("%s.%d", $interface, $tag);
+  if ($tag == 0) {
+      $ifname = $interface;
+  }
+  return $ifname;
+}
+
+# this is the table that gets hit right upon packet receive
+sub get_iptables_rx_chain_name {
+  my $version = shift @_;
+  my $name = sprintf("NG_RX_V%d", $version);
+  return $name;
+}
+
+sub get_iptables_tx_chain_name {
+  my $version = shift @_;
+  my $name = sprintf("NG_TX_V%d", $version);
+  return $name;
+}
+
+sub get_version_tunnel_interfaces {
+    my $vlan_id = shift @_;
+    my @tunnels = ();
+    $result = `ip link show | grep -E "tun.+\.$vlan_id"`;
+    my @lines = split /\n/, $result;
+    foreach my $line (@lines) {
+	if ($line =~ m/.*tun([\dabcdef]+)\.(\d+)/) {
+	    my $tun = sprintf("tun$1.$2");
+	    push (@tunnels, $tun);
+	}
+    }
+    return @tunnels;
+}
+
+sub get_version_tunnel_addresses {
+    my $vlan_id = shift @_;
+    my @addresses = ();
+    $result = `ip link show | grep -E "tun.+\.$vlan_id"`;
+    my @lines = split /\n/, $result;
+    foreach my $line (@lines) {
+	if ($line =~ m/.*tun([\dabcdef]+)\.(\d+)/) {
+	    print "$1\n";  
+	    my $addr = hex $1;
+	    $addr = sprintf("%d\.%d\.%d\.%d", ($addr >> 24) & 0xff,
+			    ($addr >> 16)  & 0xff,
+			    ($addr >> 8) & 0xff,
+			    ($addr & 0xff));
+	    push (@addresses, $addr);
+	    print "$addr\n";
+	}
+    }
+    print "Result : $result\n";
+    print "$result\n";
+    return @addresses;
+}
+
+# first argument is the interface name
+# second argument is the vlan tag
+sub create_vlan {
+  my $interface = shift @_;
+  my $tag = shift @_;
+  my $address = shift @_;
+  print "Creating interface for vlan = $tag on $interface\n";
+  my $address_prefix = "not_found";
+  if ($address =~ m/(\d+\.\d+\.\d+)\.\d+/) {
+    $address_prefix = $1;
+  }
+  my $new_if_name = get_vlan_ifname($interface, $tag);
+  print "Running : ip link add link $interface name $new_if_name type vlan id $tag;\n";
+  my $result = `ip link add link $interface name $new_if_name type vlan id $tag`;
+  print "Result : $result\n";
+  sleep 1;  # needed but unwanted --- needs to disappear for speedy setup
+  print "Running : ip addr add $address/24 brd $address_prefix.255 dev $new_if_name\n";  
+  $result = `ip addr add $address/24 brd $address_prefix.255 dev $new_if_name`;  
+  print "$result\n";
+  print "Running : ip link set dev $new_if_name up\n";
+  $result = `ip link set dev $new_if_name up`;
+  print "$result";
+}
+
+sub destroy_vlan {
+  my $vlan_interface_name = shift @_;
+  my $tag = shift @_;
+  my $ifname = $vlan_interface_name;
+  # if the interface name is not in ethX.TAG notation
+  # then make it so
+  if (!($vlan_interface_name =~ m/.+\.\d+/)) {
+    $ifname = get_vlan_ifname($ifname, $tag);
+  }
+  print "Running : ip link del $ifname\n";
+  $result = `ip link del $ifname`;
+  print "$result\n";
+}
+
+sub get_ethernet_address {
+  my $ifname = shift @_;
+  my $address = "0.0.0.0";
+  my $result = `ip address show $ifname | grep inet `;
+  if ($result =~ m/inet (\d+\.\d+\.\d+\.\d+)\/(\d+)/) {
+    $address = $1;
+  } 
+  return $address;
+}
+
+# looks in the default table for a next hop switch/router
+sub get_gateway_address {
+  my $ifname = shift @_;
+  my $route_output = `route -n | grep -E "^0.0.0.0" | grep $ifname`;
+  my $gw = "gw_not_found";
+  if ($route_output =~ m/[\w\d\.]\s+(\d+\.\d+\.\d+\.\d+)/) {
+    $gw = $1;
+  }
+  return $gw;
+}
+
+sub get_vlan_rt_table_name {
+  my $vlan_id = shift @_;
+  my $table_name = sprintf("ng.v%d", $vlan_id);
+  return $table_name;
+}
+
+sub get_vlan_rt_table_number {
+  my $vlan_id = shift @_;
+  my $table_id = 200 + $vlan_id;
+  return $table_id;
+}
+
+sub get_tunnel_rt_table_name {
+  $vlan_id = shift @_;
+  $remote = shift @_;
+  my $name = "unknown_rt_table";
+  if ($remote =~ m/(\d+)\.(\d+)\.(\d+)\.(\d+)/) { 
+    $name = sprintf ("ng%02x%02x%02x%02x.%d", $1, $2, $3, $4, $vlan_id);
+  } else {
+    print "Remote format doesn't match $remote\n";
+  }
+  return $name;
+}
+
+sub create_vlan_routing_table {
+  my $vlan_id = shift @_;
+  my $table_name = get_vlan_rt_table_name($vlan_id);
+  # backup
+  `cp /etc/iproute2/rt_tables /etc/iproute2/rt_tables~`;
+  # remove the previous entry
+  `cat  /etc/iproute2/rt_tables | grep -v $table_name > /tmp/rt_tables.tmp`;
+  my $table_number = get_vlan_rt_table_number($vlan_id);
+  print "Running : echo $table_number $table_name >> /tmp/rt_tables.tmp\n"; 
+  `echo $table_number $table_name >> /tmp/rt_tables.tmp`;
+  print "Running : cp /tmp/rt_tables.tmp /etc/iproute2/rt_tables\n";
+  `cp /tmp/rt_tables.tmp /etc/iproute2/rt_tables`;
+  print "Running : ip rule add fwmark $vlan_id table $table_name\n";
+  `ip rule add fwmark $vlan_id table $table_name`;
+}
+
+sub destroy_routing_table {
+  my $vlan_id = shift @_;
+  my $table_name = shift @_;
+  print "Running : ip route flush table $table_name\n";
+  `ip route flush table $table_name`;
+  print "Running : ip rule del fwmark $vlan_id table $table_name\n";
+  `ip rule del fwmark $vlan_id table $table_name`;
+  `cp /etc/iproute2/rt_tables /etc/iproute2/rt_tables~`;
+  `cat  /etc/iproute2/rt_tables | grep -v $table_name > /tmp/rt_tables.tmp`;
+  `cp /tmp/rt_tables.tmp /etc/iproute2/rt_tables`;
+}
+
+sub destroy_vlan_routing_table {
+  my $vlan_id = shift @_;
+  my $table_name =  get_vlan_rt_table_name($vlan_id);
+  destroy_routing_table($vlan_id, $table_name);
+}
+
+sub copy_gw_to_vlan {
+  my $ifname = shift @_;
+  my $target_vlan = shift @_;
+  my $gw = get_gateway_address($ifname);
+  `ping -I $ifname -c 1 $gw`;  # force arp entry
+  my $arp_result = `arp -n -i $ifname $gw | grep $gw`;
+  my $gw_mac = "U:N:K:N:O:W:N";
+  if ($arp_result =~ m/[\w\d\.]+\s+\w+\s+([\w:]+)/) {
+    $gw_mac = $1;
+  }
+  if ($gw_mac eq "U:N:K:N:O:W:N") {
+    print "Failed to correctly identify GW MAC\n";
+    return;
+  }
+  # this is a HACK... because it doesn't allow for MAC's to change
+  # but the entire setup is a little rigged. This could be done
+  # better in OF when we receive a link up/down message
+  my $vlan_ifname = get_vlan_ifname($ifname, $target_vlan);
+  print "Running : arp -s -i $vlan_ifname $gw $gw_mac\n";
+  my $result = `arp -s -i $vlan_ifname $gw $gw_mac`;
+  print "$result\n";
+  # TODO ... add a default route to the vlan routing table
+  my $rt_table = get_vlan_rt_table_name($target_vlan);
+  print "Running : ip route add default via $gw dev $vlan_ifname table $rt_table\n";
+  `ip route add default via $gw  dev $vlan_ifname table $rt_table`;
+}
+
+sub get_tunnel_name {
+  my $vlan_id = shift @_;
+  my $remote_ip = shift @_;
+  my $tunnel_name = "notunnel";
+  if ($remote_ip =~ m/(\d+)\.(\d+)\.(\d+)\.(\d+)/) {
+     $tunnel_name = sprintf("tun%02x%02x%02x%02x.%d", $1, $2, $3, $4, $vlan_id);
+  } else {
+    print "Bad argument : $remote_tunnel\n";
+  }
+  return $tunnel_name;
+}
+
+sub create_gre_tunnel {
+  my $ifname = shift @_;
+  my $vlan_id = shift @_;
+  my $remote_ip = shift @_;
+  my $local_ip = get_ethernet_address($ifname);
+  my $tunnel_name = get_tunnel_name($vlan_id, $remote_ip);
+  my $vlan_ifname = $ifname;
+  # if we do have special interface operations based on the 
+  # version of tunnel on which the packet was received
+  my $ipt_name = "";
+  if ($vlan_id > 0) {
+      $vlan_ifname = get_vlan_ifname($ifname, $vlan_id);
+      $ipt_name = get_iptables_rx_chain_name($vlan_id);
+  }
+  print "Running : iptunnel add $tunnel_name mode gre remote $remote_ip  local $local_ip ttl 225 dev $vlan_ifname\n";
+  `iptunnel add $tunnel_name mode gre remote $remote_ip  local $local_ip ttl 225 dev $vlan_ifname\n`;
+  print "Running : ifconfig $tunnel_name $local_ip/32 up\n";
+  `ifconfig $tunnel_name $local_ip/32 up`;
+  print "Running : ifconfig $tunnel_name pointopoint $remote_ip\n";
+  `ifconfig $tunnel_name pointopoint $remote_ip`;
+  print "Running : ifconfig $tunnel_name multicast\n";
+  `ifconfig $tunnel_name multicast`;
+  if (!($ipt_name eq "")) {
+    print "Running :  iptables -A PREROUTING -t mangle -i $tunnel_name -j $ipt_name\n";
+    `iptables -D PREROUTING -t mangle -i $tunnel_name -j $ipt_name`;
+    my $result = `iptables -A PREROUTING -t mangle -i $tunnel_name -j $ipt_name`;
+    print "$result";
+
+  }
+  `echo 0 > /proc/sys/net/ipv4/conf/$vlan_ifname/rp_filter`;
+  `echo 0 > /proc/sys/net/ipv4/conf/$tunnel_name/rp_filter`;
+}
+
+sub destroy_gre_tunnel {
+  my $vlan_id = shift @_;
+  my $remote_ip = shift @_;
+  my $tunnel_name = get_tunnel_name($vlan_id, $remote_ip);
+ 
+ my $ipt_name = "";
+  if ($vlan_id > 0) {
+      $vlan_ifname = get_vlan_ifname($ifname, $vlan_id);
+      $ipt_name = get_iptables_rx_chain_name($vlan_id);
+  }
+  if (!($ipt_name eq "")) {
+    print "Running :  iptables -D PREROUTING -t mangle -i $tunnel_name -j $ipt_name\n";
+    my $result = "";
+    $result = `iptables -D PREROUTING -t mangle -i $tunnel_name -j $ipt_name`;
+    print "$result";
+  }
+ 
+  print "Running : ifconfig $tunnel_name down\n";
+  `ifconfig $tunnel_name down`;
+  print "Running : iptunnel del $tunnel_name\n";
+  `iptunnel del $tunnel_name`;
+}
+
+# todo : this needs to be extended to route on the same bits
+#   on which the hardware switch routes. for now we just route by
+#   destination. 
+sub route_vip {
+  my $vlan_id = shift @_;
+  my $vip = shift @_;
+  my $remote_tunnel_ip = shift @_;
+  # note: that we set tunnel vlan id == 0 because this is run to the
+  # backend which is always listening on tunnel id 0.
+  my $tunnel_name = get_tunnel_name(0, $remote_tunnel_ip);
+  my $rt_table_name = get_vlan_rt_table_name($vlan_id);
+  print "Running : ip route add $vip dev $tunnel_name table $rt_table_name\n";
+  `ip route add $vip dev $tunnel_name table $rt_table_name`;
+}
+
+sub initialize_ipt_version_chain {
+  my $vlan_id = shift @_;
+  my $ipt_name = get_iptables_rx_chain_name($vlan_id);
+  print "Running : iptables -t mangle -F $ipt_name\n";
+  `iptables -t mangle -F $ipt_name`;
+  `iptables -t raw -F $ipt_name`;
+  # The raw table is meant to prevent tracking of packets. In particular, we want to disable
+  # connection tracking on packets that establish a NEW connection but that get forwarded
+  # to another switch.  So, the raw table contains (for each version) a set of HW forwarding
+  # rules that forward a packet to another switch and marks those as UNTRACKED because the
+  # tracking is supposed to be initiated at the "primary switch for the packet".
+  `iptables -t raw -I $ipt_name 1 -p tcp ! --syn -j RETURN`;
+  print "Running : iptables -t mangle -A $ipt_name -m mark --mark 0 -j MARK --set-mark $vlan_id\n";
+  `iptables -t mangle -A $ipt_name  -m mark --mark 0 -j MARK --set-mark $vlan_id`;
+
+  print "Running : iptables -I $ipt_name 1 -t mangle -j NG_existing_connections\n";
+  `iptables -I $ipt_name 1 -t mangle -j NG_existing_connections`;
+}
+
+sub create_iptables_rx_chain {
+  my $if_name = shift @_;
+  my $vlan_id = shift @_;
+  my $priority = shift @_;
+  if ($priority eq "") {
+    $priority = 1;
+  }
+  print "create_iptables_rx_chain $if_name: $vlan_id : $priority\n";
+  my $version_if_name = get_vlan_ifname($if_name, $vlan_id);
+  my $ipt_name = get_iptables_rx_chain_name($vlan_id);
+  print "Running : iptables -t mangle -N $ipt_name\n";
+  `iptables -t mangle -F $ipt_name`;
+  `iptables -t mangle -X $ipt_name`;
+  `iptables -t mangle -N $ipt_name`;
+  `iptables -t raw -F $ipt_name`;
+  `iptables -t raw -X $ipt_name`;
+  `iptables -t raw -N $ipt_name`;
+  print "Running : iptables -I PREROUTING $priority -t mangle -i $version_if_name -j $ipt_name\n";
+  `iptables -D PREROUTING -t mangle -i $version_if_name -j $ipt_name`;
+  `iptables -D PREROUTING -t raw -i $version_if_name -j $ipt_name`;
+  `iptables -I PREROUTING $priority -t mangle -i $version_if_name -j $ipt_name`;
+  `iptables -I PREROUTING $priority -t raw -i $version_if_name -j $ipt_name`;
+   print "Running : iptables -I PREROUTING $priority -t mangle -m mark --mark $vlan_id -j $ipt_name\n";
+  `iptables -D PREROUTING -t mangle -m mark --mark $vlan_id -j $ipt_name`;
+  `iptables -D PREROUTING -t raw -m mark --mark $vlan_id -j $ipt_name`;
+  `iptables -I PREROUTING $priority -t mangle -m mark --mark $vlan_id -j $ipt_name`;
+  `iptables -I PREROUTING $priority -t raw -m mark --mark $vlan_id -j $ipt_name`;
+   `iptables -I NG_existing_connections 2 -t mangle -m mark --mark $vlan_id -j RETURN`;
+
+  initialize_ipt_version_chain($vlan_id);
+  # now tag every incoming packet with the version so we can route on it 
+#  print "Running : iptables -t mangle -A $ipt_name -j MARK --set-mark $vlan_id\n";
+#  `iptables -t mangle -A $ipt_name -j MARK --set-mark $vlan_id`;
+ # print "Running : iptables -I $ipt_name 1 -t mangle -j NG_existing_connections\n";
+  #`iptables -I $ipt_name 1 -t mangle -j NG_existing_connections`;
+}
+
+sub destroy_iptables_rx_chain {
+  my $if_name = shift @_;
+  my $vlan_id = shift @_;
+  my $version_if_name = get_vlan_ifname($if_name, $vlan_id);
+  my $ipt_name = get_iptables_rx_chain_name($vlan_id);
+  print "Running : iptables -D PREROUTING -t mangle -i $version_if_name -j $ipt_name\n";
+  `iptables -D PREROUTING -t mangle -i $version_if_name -j $ipt_name`;
+  print "Running : iptables -D PREROUTING -t raw -i $version_if_name -j $ipt_name\n";
+  `iptables -D PREROUTING -t raw -i $version_if_name -j $ipt_name`;
+  print "Running : iptables -D PREROUTING -t mangle -m mark --mark $vlan_id -j $ipt_name\n";
+  `iptables -D PREROUTING -t mangle -m mark --mark $vlan_id -j $ipt_name`;
+  print "Running : iptables -D PREROUTING -t raw -m mark --mark $vlan_id -j $ipt_name\n";
+
+  `iptables -D PREROUTING -t raw -m mark --mark $vlan_id -j $ipt_name`;
+  print "Running : iptables -D NG_existing_connections -t mangle -m mark --mark $vlan_id -j RETURN\n";
+   `iptables -D NG_existing_connections -t mangle -m mark --mark $vlan_id -j RETURN`;
+
+  print "Running : iptables -t mangle -F $ipt_name\n";
+  `iptables -t mangle -F $ipt_name`;
+  print "Running : iptables -t mangle -X $ipt_name\n";
+  `iptables -t mangle -X $ipt_name`;
+  print "Running : iptables -t raw -F $ipt_name\n";
+  `iptables -t raw -F $ipt_name`;
+  print "Running : iptables -t raw -X $ipt_name\n";
+  `iptables -t raw -X $ipt_name`;
+}
+
+# this chain should be evaluated before we hit version tables because
+# existing connections are routed regardless of version
+
+sub create_iptables_rx_existing_connection_chain {
+  my $is_backend = shift @_;
+  print "Running : iptables -t mangle -N NG_existing_connections\n";
+  `iptables -t mangle -F NG_existing_connections`;
+  `iptables -t mangle -X NG_existing_connections`;
+  `iptables -t mangle -N NG_existing_connections`;
+
+  if ($is_backend) {
+      print "Running : iptables -t mangle -N NG_tcp_signals\n";
+      `iptables -t mangle -F NG_tcp_signals`;
+      `iptables -t mangle -X NG_tcp_signals`;
+      `iptables -t mangle -N NG_tcp_signals`;
+      print "Running : iptables -t mangle -I PREROUTING 1 -j NG_tcp_signals\n";
+      `iptables -t mangle -D PREROUTING -j NG_tcp_signals\n`;
+      `iptables -t mangle -I PREROUTING 1 -j NG_tcp_signals\n`;
+  }
+
+  # The intent is only to restore the mark if we didn't set the mark already
+  if (!$is_backend) {
+      print "Installing connection persistence ... \n";
+      # first we must restore the label
+      print "Running : iptables -I NG_existing_connections 1 -t mangle -j CONNMARK --restore-mark\n";
+      `iptables -I NG_existing_connections 1 -t mangle -j CONNMARK --restore-mark`;
+      # Unmarked packets are not meant for this chain
+      print "iptables -A NG_existing_connections -t mangle -m mark --mark 0 -j RETURN\n";
+       `iptables -A NG_existing_connections -t mangle -m mark --mark 0 -j RETURN`;   
+      # route like a hardware switch if the connection state is untracked
+      `iptables -A NG_existing_connections -t mangle -m state --state UNTRACKED -j RETURN`;
+      # existing connections that are marked for routing with some connmark
+      # will be accepted and routed according to their mark.
+      print "Running : iptables -t mangle -A NG_existing_connections  -m state ! --state NEW -j ACCEPT\n";  
+      `iptables -t mangle -A NG_existing_connections -m state ! --state NEW -j ACCEPT`;
+
+      # Make sure that we save our routing decision. : we only save our routing
+      # decision if the packet egresses over a tunnel to a backend
+      # print "Running : iptables -I POSTROUTING 1 -t mangle -m state ! --state UNTRACKED -m set --match-set ng.backends src,dst -m mark ! --mark 0  -j CONNMARK --save-mark\n";
+      # `iptables -D POSTROUTING -t mangle -m state ! --state UNTRACKED -m set --match-set ng.backends src,dst -m mark ! --mark 0  -j CONNMARK --save-mark`;
+      # `iptables -I POSTROUTING 1 -t mangle -m state ! --state UNTRACKED -m set --match-set ng.backends src,dst -m mark ! --mark 0  -j CONNMARK --save-mark`;
+  } else {
+      print "This is a backend. not installing connection persistence.\n";
+  }
+
+
+#  print "Running : iptables -I PREROUTING 1 -t mangle -j NG_existing_connections\n";
+#  `iptables -I PREROUTING 1 -t mangle -j NG_existing_connections`;
+}
+
+sub destroy_iptables_rx_existing_connection_chain {
+#  print "Running : iptables -D PREROUTING -t mangle -j NG_existing_connections\n";
+#  `iptables -D PREROUTING -t mangle -j NG_existing_connections`;
+  print "Running : iptables -t mangle -F NG_existing_connections\n";
+  `iptables -t mangle -F NG_existing_connections`;
+  print "Running : iptables -t mangle -F NG_tcp_signals\n";
+  `iptables -t mangle -F NG_tcp_signals`;
+  print "Running : iptables -t mangle -X NG_existing_connections\n";
+  `iptables -t mangle -X NG_existing_connections`;
+  print "Running : iptables -t mangle -X NG_tcp_signals\n";
+  `iptables -t mangle -X NG_tcp_signals`;
+  print "Running : iptables -D POSTROUTING  -t mangle -m state ! --state UNTRACKED -m set --match-set ng.backends src,dst -m mark ! --mark 0  -j CONNMARK --save-mark\n";
+  `iptables -D POSTROUTING  -t mangle -m state ! --state UNTRACKED  -m set --match-set ng.backends src,dst -m mark ! --mark 0  -j CONNMARK --save-mark`;
+}
+
+sub erase_tunnel_table_name {
+  my $name = shift @_;
+  print "Erasing tunnel name $name\n";
+  print "Runnning : cat /etc/iproute2/rt_tables | grep -v $name > /tmp/rt_tables \n";
+  `cat /etc/iproute2/rt_tables | grep -v $name > /tmp/rt_tables `;
+  print "Running : cp /tmp/rt_tables /etc/iproute2/rt_tables\n";
+  `cp /tmp/rt_tables /etc/iproute2/rt_tables`;
+}
+
+
+# computes a consistent table number
+sub get_consistent_table_number {
+  my $table_name = shift @_; 
+  if ($table_name =~ m/ng([\dabcdef]+)\.(\d+)/) {
+      my $addr = hex $1;
+      my $version = $2;
+      # we take the last 16 bit of the address
+      # and the version to compute the routing table number
+      my $table_number = ($version << 16) | (0xffff & $addr); 
+      erase_tunnel_table_name($table_name);
+      print "Setting $table_number for $table_name\n";
+      `echo $table_number $table_name >> /etc/iproute2/rt_tables`;
+      return $table_number;
+  }
+  print "Cannot parse tunnel table name:  $table_name\n";
+  return -1;
+}
+
+# scans for an available table number greater than 10K
+sub get_table_number {
+  my $table_name = shift @_; 
+  my $must_exist = shift @_;
+  open my $fh, '<', "/etc/iproute2/rt_tables" or die $!;
+  my %table_numbers = ();
+  while (<$fh>) {
+    if (m/^(\d+)\s+([\w\d\.]+)/) {
+      my $number = $1;
+      my $name = $2;
+      if ($name eq $table_name) {
+        return $number;
+      }
+      $table_names{$2} = $1;
+      $table_numbers{$1} = $2;
+    }
+  }
+  close $fh or die $!;
+  if ($must_exist) {
+    return -1;
+  }
+  my $last_number = 10000;
+  for my $key (sort keys %table_numbers) {
+    if ($key == $last_number) {
+      $last_number = $key + 1;  # maybe the next number is free
+    } elsif ($key >= 10000) {
+      last;
+    }
+  }
+  # last_number contains a valid table number that is unclaimed
+  `echo $last_number $table_name >> /etc/iproute2/rt_tables`;
+  return $last_number;
+}
+
+sub erase_tunnel_all_table_names_version {
+    my $version = shift @_;
+   print "Runnning : cat /etc/iproute2/rt_tables | grep -v $name > /tmp/rt_tables \n";
+  `cat /etc/iproute2/rt_tables | grep -v -E "ng\.v$version|tun.+\.$version" > /tmp/rt_tables `;
+  print "Running : cp /tmp/rt_tables /etc/iproute2/rt_tables\n";
+  `cp /tmp/rt_tables /etc/iproute2/rt_tables`;   
+}
+
+sub create_per_tunnel_tx_rule {
+  my $vlan = shift @_;
+  my $remote = shift @_;
+
+  print "vlan = $vlan remote = $remote\n";
+
+  my $table_name = get_tunnel_rt_table_name($vlan, $remote);
+  my $table_number = get_consistent_table_number($table_name);
+  my $tunnel_name =  get_tunnel_name($vlan, $remote);
+
+  # this means that the tunnel --- with $table_name is now
+  # identified with a fw mark that corresponds to the unique
+  # routing table number. This is what the iptables rules will
+  # have to setup if they want a packet to go to $remote via version
+  # $vlan.
+  print "Running : ip rule add fwmark $table_number table $table_name\n";
+  `ip rule add fwmark $table_number table $table_name`;
+  print "Running : ip route add default dev $tunnel_name table $table_name\n";
+  `ip route add default dev $tunnel_name table $table_name`;
+}
+
+sub destroy_per_tunnel_tx_rule {
+  my $vlan = shift @_;
+  my $remote = shift @_;
+
+  my $table_name = get_tunnel_rt_table_name($vlan, $remote);
+  my $table_number = get_consistent_table_number($table_name);
+  my $tunnel_name =  get_tunnel_name($vlan, $remote);
+  
+  print "Running : ip rule del fwmark $table_number table $table_name\n";
+  `ip rule del fwmark $table_number table $table_name`;
+  print "Running : ip route flush table $table_name\n";
+  `ip route flush table $table_name`;
+#  print "Running : ip rule flush table $table_name\n";
+#  `ip rule flush table $table_name`;
+  erase_tunnel_table_name($table_name);
+}
+
+
+# updates the version of the vip from one version to another
+# this selects a new routing table for the vip ... ONLY ON THE HWSWITCH
+sub update_vip_version {
+  my $vip = shift @_;
+  my $from_vlan_id = shift @_;
+  my $to_vlan_id = shift @_;
+  # todo ipsets would be a more efficient data structure to do this
+  `iptables -D PREROUTING -t mangle -d $vip -j MARK --set-mark $from_vlan_id`;
+  `iptables -I PREROUTING 1 -t mangle -d $vip -j MARK --set-mark $to_vlan_id`; 
+}
+
+sub ecmp_outbound {
+  my $command = shift @_;  # add or del
+  my $ifname = shift @_;
+  my $vlan_id = shift @_;
+  my $prefix = shift @_;
+  my $ifcount = shift @_;
+  my $nexthops = sprintf("ip route $command %s scope global", $prefix);
+  for (my $i = 0; $i < $ifcount; ++$i) {
+    my $sswitch = sprintf("10.99.88.%d", $i + 81);
+    my $tunnel = get_tunnel_name($vlan_id, $sswitch);
+    $nexthops = sprintf("%s nexthop dev $tunnel weight 1", $nexthops, $ifname);
+  }
+  print "Running : $nexthops\n";
+  my $result = `$nexthops`;
+  print "$result\n";
+}
+
+sub parse_routing_config {
+  my $ifname = shift @_;
+  my $filename = shift @_;
+  my $is_backend = shift @_;
+
+  my $local_address = get_ethernet_address($ifname);
+  print "Reading routing config $filename ...\n";
+  # Expected file format
+  #
+  # version = XX
+  # switch = XX
+  # rules = XX
+  #
+  open my $fh, '<', $filename or die $!;
+  my $version = -1;
+  my $switch = 0;
+  my $rules = 0;
+  my %route = ();
+  my %send_to = ();
+  while (<$fh>) {
+    my $line = $_;
+    if ($line =~ m/\s*version\s*=\s*(\d+)/) {
+      $version = $1;
+    } elsif ($line =~ m/\s*switch\s*=\s*([\d\.]+)/) {
+      $switch = $1;
+    } elsif ($line =~ m/\s*rules\s*=\s*(\d+)/) {
+      $rules = $1;
+    } elsif ($line =~ m/iptables.+\-\-u32\s+(\"[^\"]+\").+REDIRECT_TO\s+([\d\.]+)/) {
+      if ($switch eq $local_address) {
+        print "Route $1 -> $2\n";
+        $route{$1} = $2;
+      } else {
+        print "switch $switch is not me $local_address\n";
+      }
+    } elsif ($line =~ m/iptables.+\-\-u32\s+(\"[^\"]+\").+SEND_TO\s+([\d\.]+)/) {
+      if ($switch eq $local_address) {
+        print "Send to $1 -> $2\n";
+        $send_to{$1} = $2;
+      } else {
+        print "switch $switch is not me $local_address\n";
+      }
+    } else {
+      print "Ignoring config line : $line";
+    }
+  }
+  if ($is_backend) {
+      $version = 0;
+      print "Running : iptables -F NG_tcp_signals -t mangle\n";
+      `iptables -F NG_tcp_signals -t mangle`;
+  } else {
+      create_iptables_rx_chain($ifname, $version);
+  }
+  my $ipt_chain = "NG_tcp_signals";
+  if ($version > 0) {
+      $ipt_chain = get_iptables_rx_chain_name($version);
+  }
+  for my $key (sort keys %route) {
+    my $remote = $route{$key};
+    my $match = $key;
+    my $tunnel_name = get_tunnel_rt_table_name($version, $remote);
+    print "Tunnel name = $tunnel_name version $version\n";
+    my $table_number = get_consistent_table_number($tunnel_name, 1);
+    if ($table_number >= 0) {
+      print "routing $key -> $remote\n";
+      if (!($is_backend)) {
+	  print "Running : iptables -A $ipt_chain -t mangle -m u32 --u32 $match  -j MARK --set-mark $table_number\n";
+	  `iptables -D $ipt_chain -t mangle -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	  $result = `iptables -A $ipt_chain -t mangle -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	  # deflected packets shouldn't be tracked ... we are not terminating
+	  # the connection. If we tracked those packets we'd mess up state
+	  # tracking
+	  print "Running : iptables -A $ipt_chain -t raw -m u32 --u32 $match  -j MARK --set-mark $table_number\n";
+	  `iptables -D $ipt_chain -t raw  -m u32 --u32 $match -j NOTRACK`;
+	  `iptables -A $ipt_chain -t raw  -m u32 --u32 $match -j NOTRACK`
+      } else {
+	  `iptables -D $ipt_chain -t mangle -p TCP --tcp-flags SYN,ACK SYN,ACK -m u32 --u32 $match -j MARK  --set-mark $table_number`;
+	  `iptables -A $ipt_chain -t mangle -p TCP --tcp-flags SYN,ACK SYN,ACK -m u32 --u32 $match -j MARK  --set-mark $table_number`;
+	  `iptables -D $ipt_chain -t mangle -p TCP --tcp-flags FIN FIN -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	  `iptables -A $ipt_chain -t mangle -p TCP --tcp-flags FIN FIN -m u32 --u32 $match -j MARK --set-mark $table_number`;
+      }
+      print "$result";
+    } else {
+      print "Failed to look up redirect: $tunnel_name\n";
+    }
+  }
+  for my $key (sort keys %send_to) {
+    my $remote = $send_to{$key};
+    my $match = $key;
+    my $ipt_chain = get_iptables_rx_chain_name($version);
+    my $tunnel_name = get_tunnel_rt_table_name(0, $remote);
+    print "Tunnel name = $tunnel_name\n";
+    my $table_number = get_consistent_table_number($tunnel_name, 1);
+    if ($table_number >= 0) {
+      print "routing $key -> $remote\n";
+       if (!($is_backend)) {
+	   print "Running : iptables -A $ipt_chain -t mangle -m u32 --u32 $match -j MARK --set-mark $table_number\n";
+	   `iptables -D $ipt_chain -t mangle -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	   $result = `iptables -A $ipt_chain -t mangle -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	   print "$result";
+       } else {
+	   print "Running : iptables -A $ipt_chain -t mangle  -p TCP --tcp-flags SYN,ACK SYN,ACK -m u32 --u32 $match -j MARK --set-mark $table_number\n";
+	   $result = `iptables -D $ipt_chain -t mangle  -p TCP --tcp-flags SYN,ACK SYN,ACK -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	   $result = `iptables -A $ipt_chain -t mangle  -p TCP --tcp-flags SYN,ACK SYN,ACK -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	   print "$result";
+ 	   print "Running : iptables -A $ipt_chain -t mangle  -p TCP --tcp-flags FIN FIN -m u32 --u32 $match -j MARK --set-mark $table_number\n";
+	   $result = `iptables -D $ipt_chain -t mangle  -p TCP --tcp-flags FIN FIN -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	   $result = `iptables -A $ipt_chain -t mangle  -p TCP --tcp-flags FIN FIN -m u32 --u32 $match -j MARK --set-mark $table_number`;
+	   print "$result";
+      }
+    } else {
+      print "Failed to look up backend tunnel : $tunnel_name";
+    }
+  }
+}
+
+sub setup_ns {
+  my $vipname = shift @_;
+  my $vip = shift @_;
+  print "Running : ip netns add $vipname\n";
+  `ip netns add $vipname`;
+  my $veth0name = $vipname . "veth0";
+  my $veth1name = $vipname . "veth1";
+  print "Running : ip link add $veth0name type veth peer name $veth1name\n";
+  `ip link add $veth0name type veth peer name $veth1name`;
+  print "Running : ip link set $veth1name netns $vipname\n";
+  `ip link set $veth1name netns $vipname`;
+  if ($vip =~ m/(\d+\.\d+\.\d+)\.\d+/) {
+    $vip_prefix = $1;
+    $vip_gw = "$1.1";
+    print "Running : ifconfig $veth0name $vip_gw pointopoint $vip up\n";
+    `ifconfig $veth0name $vip_gw pointopoint $vip up`;
+    print "Running : ip netns exec $vipname ifconfig $veth1name $vip pointopoint $vip_gw up\n";
+    `ip netns exec $vipname ifconfig $veth1name $vip pointopoint $vip_gw up`;
+    print "Running : sysctl -w net.ipv4.ip_forward=1\n";
+    `sysctl -w net.ipv4.ip_forward=1`;
+    print "Running : ip netns exec $vipname ip route add default via $vip_gw\n";
+    `ip netns exec $vipname ip route add default via $vip_gw`;
+  }
+}
+
+sub add_to_backendset {
+    my $be = shift @_;
+    my $be_if = get_tunnel_name(0, $be);
+    print "Running : ipset add ng.backends $be\n";
+    `ipset add ng.backends $be`;
+    print "Running : iptables -I POSTROUTING 1  -t mangle -m state ! --state UNTRACKED -m mark ! --mark 0 -o $be_if -j CONNMARK --save-mark\n";
+    `iptables -D POSTROUTING  -t mangle -m state ! --state UNTRACKED  -m mark ! --mark 0 -o $be_if -j CONNMARK --save-mark`;
+    `iptables -I POSTROUTING 1  -t mangle -m state ! --state UNTRACKED -m mark ! --mark 0 -o $be_if -j CONNMARK --save-mark`;
+}
+
+sub remove_from_backendset { 
+    my $be = shift @_;
+    my $be_if = get_tunnel_name(0, $be);
+    print "Running : ipset del ng.backends $be\n";
+    `ipset del ng.backends $be`;
+    print "Running : iptables -D POSTROUTING  -t mangle -m state ! --state UNTRACKED  -m mark ! --mark 0 -o $be_if -j CONNMARK --save-mark\n";
+    `iptables -D POSTROUTING   -t mangle -m state ! --state UNTRACKED -m mark ! --mark 0 -o $be_if -j CONNMARK --save-mark`;
+}
+
+sub install_do_not_track_rules {
+    my $local_ip = get_ethernet_address("eth0");
+    if ($local_ip =~ m/(\d+\.\d+\.\d+)\.\d+/) {
+	my $local_net = $1 . ".0/24";
+	print "Local net = $local_net\n Installing DONOTTRACK\n";
+	print "Running : iptables -t raw -I PREROUTING 1 -d $local_net -s $local_net -j NOTRACK\n";
+	`iptables -t raw -D PREROUTING -d $local_net -s $local_net -j NOTRACK`;
+	`iptables -t raw -I PREROUTING 1 -d $local_net -s $local_net -j NOTRACK`;
+	print "Running : iptables -t raw -I OUTPUT 1 -d $local_net -s $local_net -j NOTRACK\n";
+	`iptables -t raw -D OUTPUT -d $local_net -s $local_net -j NOTRACK`;
+	`iptables -t raw -I OUTPUT 1 -d $local_net -s $local_net -j NOTRACK`;
+	    
+	print "Running : iptables -t raw -I PREROUTING 1 -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK\n";
+	`iptables -t raw -D PREROUTING -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK`;
+	`iptables -t raw -I PREROUTING 1 -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK`;
+	print "Running : iptables -t raw -I OUTPUT 1 -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK\n";
+	`iptables -t raw -D OUTPUT -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK`;
+	`iptables -t raw -I OUTPUT 1 -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK`;
+
+	print "Running :iptables -t raw -I PREROUTING 1 -s 224.0.0.0/4 -j NOTRACK\n";
+	`iptables -t raw -D PREROUTING -s 224.0.0.0/4 -j NOTRACK`;
+	`iptables -t raw -I PREROUTING 1 -s 224.0.0.0/4 -j NOTRACK`;
+
+	print "Running : iptables -t raw -I PREROUTING 1 -d 224.0.0.0/4 -j NOTRACK\n";
+	`iptables -t raw -D PREROUTING -d 224.0.0.0/4 -j NOTRACK`;
+	`iptables -t raw -I PREROUTING 1 -d 224.0.0.0/4 -j NOTRACK`;
+
+	print "Running : iptables -t raw -I OUTPUT 1 -d 224.0.0.0/4 -j NOTRACK\n";
+	`iptables -t raw -D OUTPUT -d 224.0.0.0/4 -j NOTRACK`;
+	`iptables -t raw -I OUTPUT 1 -d 224.0.0.0/4 -j NOTRACK`;
+    } else {
+	print "!!! local ip $local_ip doesn't match\n";
+    }
+}
+
+sub destroy_do_not_track_rules {
+    my $local_ip = get_ethernet_address("eth0");
+    if ($local_ip =~ m/(\d+\.\d+\.\d+)\.\d+/) {
+	my $local_net = $1 . ".0/24";
+	`iptables -t raw -D PREROUTING -d $local_net -s $local_net -j NOTRACK`;
+	`iptables -t raw -D OUTPUT -d $local_net -s $local_net -j NOTRACK`;
+	`iptables -t raw -D PREROUTING -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK`;
+	`iptables -t raw -D OUTPUT -d 127.0.0.0/8 -s 127.0.0.0/8 -j NOTRACK`;
+	`iptables -t raw -D PREROUTING -s 224.0.0.0/4 -j NOTRACK`;
+	`iptables -t raw -D PREROUTING -d 224.0.0.0/4 -j NOTRACK`;
+	`iptables -t raw -D OUTPUT -d 224.0.0.0/4 -j NOTRACK`;
+    } else {
+	print "!!! local ip $local_ip doesn't match\n";
+    }
+}
+
+sub dump_version {
+    my $version = shift @_;
+    print "========================================\n";
+    print "ROUTING VERSION $version FULL DUMP\n";
+    print "========================================\n\n";
+    my $result = `ip link show | grep "\\.$version"`;
+    print "Version specific interfaces: \n\n $result";
+    print "=========================================\n\n";
+    print "Firewall marks for version\n";
+    $result = `grep "\\.v$version" /etc/iproute2/rt_tables`;
+    print "Default mark if packets are not specifically matched:\n$result\n";
+    $result = `grep "\\.$version" /etc/iproute2/rt_tables`;
+    print "Mark intended to decapsulate packets from other soft- and hard-switches :\n$result\n";
+    print "=========================================\n\n";
+    print "Routing for version (achieved via marking in iptables)\n";
+    $result = `iptables -L NG_RX_V$version -t mangle -n`;
+    print "$result\n";
+    my $result1 = `ip rule ls | grep "\\.$version"`;
+    my $result2 = `ip rule ls | grep "\\.v$version"`;
+    $result = "$result1$result2";
+    print "Policy routes that drive marked packets toward a specific routing table\n$result\n";
+    print "Each of the above routing tables only has a default route to\n";
+    print "the one interface tunXYZ that is named in the routing table.\n";
+    print "this can be checked by running:\n    ip route show table <tablename>\n";
+    
+    print "=========================================\n\n";    
+    $result = `ipset -L ng.backends`;
+    print "Backends : $result\n";
+    my $result = `ip link show | grep "\\.0"`;
+    print "Backend tunnels : $result \n";
+    print "========================================\n\n";
+    $result = `iptables -L -n -t raw | grep NOTRACK`;
+    print "Untracked connections:\n";
+    $result = `iptables -L OUTPUT -n -t raw | grep NOTRACK`;
+    print "OUTPUT (table=raw)\n$result\n";
+    $result = `iptables -L PREROUTING -n -t raw | grep NOTRACK`;
+    print "PREROUTING (table=raw)\n$result\n\n";
+    print "Sticky connections:\n";
+    $result = `iptables -L POSTROUTING -n -t mangle | grep CONN`;
+    print "Connection tracking (POSTROUTING table=mangle):\n$result\n";
+
+    $result = `iptables -L POSTROUTING -n -t mangle | grep CONN`;
+    print "Connection preserve routing (POSTROUTING table=mangle):\n$result\n";
+
+    $result = `iptables -L NG_existing_connections -n -t mangle`;
+    print "Handle pre-exising routing decisions:\n$result\n";
+
+    $result = `iptables -L NG_tcp_signals -n -t mangle`;
+    print "Tcp singals (on backends only):\n$result\n";
+    print "========================================\n\n";
+}
+
+
+
+# MAIN
+if ($addr_arg eq "") {
+  $vlan_addr = get_ethernet_address($if_name);
+}
+
+if ($command eq "addvlan") {
+    if ($ARGV[1] eq "help") {
+	print "addvlan <ifname> <version/vlan> [ip_address_to_use : opt]\n";
+	exit(0);
+    }
+    create_vlan($if_name, $vlan_id, $vlan_addr);
+    create_vlan_routing_table($vlan_id);
+    # This step might be replaceable by configuring /proc/sys/net...
+    copy_gw_to_vlan($if_name, $vlan_id);
+    create_iptables_rx_chain($if_name, $vlan_id, 1);
+} elsif ($command eq "delvlan") {
+    if ($ARGV[1] eq "help") {
+	print "delvlan <ifname> <version/vlan>\n";
+	exit(0);
+    }
+    destroy_vlan_routing_table($vlan_id);
+    destroy_vlan($if_name, $vlan_id);
+    destroy_iptables_rx_chain($if_name, $vlan_id);
+} elsif ($command eq "addtunnel") {
+    if ($ARGV[1] eq "help") {
+	print "addtunnel <ifname> <version/vlan> <remote_tunnel_ep_ip>\n";
+	exit(0);
+    }
+    if ($addr_arg eq "") {
+	print "Must provide a remote IP to tunnel to.\n";
+	exit(-1);
+    }
+    create_gre_tunnel($if_name, $vlan_id, $addr_arg);
+    create_per_tunnel_tx_rule($vlan_id, $addr_arg);
+} elsif ($command eq "addbackend") {
+    # format : addbackend eth0 10.99.88.84
+    if ($ARGV[1] eq "help") {
+	print "addbackend <ifname> <version/vlan> <remote_backend_ip>\n";
+	exit(0);
+    }
+    $addr_arg = $ARGV[2];
+    $vlan_id = 0;
+    create_gre_tunnel($if_name, $vlan_id, $addr_arg);
+    create_per_tunnel_tx_rule($vlan_id, $addr_arg);
+    add_to_backendset($addr_arg);
+} elsif ($command eq "addbetunnel") {
+    #format addbetunnel eth0 SWSWITCH_IP // called on backend
+    if ($ARGV[1] eq "help") {
+	print "addbetunnel <ifname> <sswitch_ip>\n";
+	exit(0);
+    }
+
+    $addr_arg = $ARGV[2];
+    if ($addr_arg eq "") {
+	print "Must provide a remote IP to tunnel to.\n";
+	exit(-1);
+    }
+    create_gre_tunnel($if_name, 0, $addr_arg);
+    create_per_tunnel_tx_rule(0, $addr_arg);
+} elsif ($command eq "deltunnel") {
+    if ($ARGV[1] eq "help") {
+	print "deltunnel <ifname> <vlanid> <sswitch_ip>\n";
+	exit(0);
+    }
+    if ($addr_arg eq "") {
+	print "Must provide a remote IP to no longer tunnel to.\n";
+	print "Format : deltunnel interface vlan remote\n";
+	exit(-1);
+    } 
+    destroy_gre_tunnel($vlan_id, $addr_arg);
+    destroy_per_tunnel_tx_rule($vlan_id, $addr_arg);
+} elsif ($command eq "delbackend") {
+    if ($ARGV[1] eq "help") {
+	print "delbackend <ifname> <ip>\n";
+	exit(0);
+    }
+    $addr_arg = $ARGV[2];
+    $vlan_id = 0;
+    if ($addr_arg eq "") {
+	print "Must provide a remote IP to no longer tunnel to.\n";
+	print "Format : deltunnel interface vlan remote\n";
+	exit(-1);
+    } 
+    destroy_gre_tunnel($vlan_id, $addr_arg);
+    destroy_per_tunnel_tx_rule($vlan_id, $addr_arg);
+    remove_from_backendset($addr_arg);
+} elsif ($command eq "routevip") {
+    # this is only run on the software switch
+    if ($ARGV[1] eq "help") {
+	print "routevip <ifname> <version/vlanid> <vip> <nexthop_ip>\n";
+	exit(0);
+    }
+    if ($addr_arg eq "") {
+	print "Must provide a vip to route.\n";
+	exit(-1);
+    }
+    if ($addr_arg2 eq "") {
+	print "Must provide a tunnel ep to route to.\n";
+	exit(-1);
+    }
+    route_vip($vlan_id, $addr_arg, $addr_arg2);  
+} elsif ($command eq "updatevipversion") {
+    if ($ARGV[1] eq "help") {
+	print "updatevipverson <vip> <old_version/vlanid> <new_version/vlandid>\n";
+	exit(0);
+    }
+    my $vip = $ARGV[1];
+    my $old_version = $ARGV[2];
+    my $new_version = $ARGV[3];
+    if ($new_version eq "") {
+	$new_version = $old_version;
+	$old_version = "X";
+    }
+    update_vip_version($vip, $old_version, $new_version);
+} elsif ($command eq "init") {
+    if ($ARGV[1] eq "help") {
+	print "init [hw|backend|sw] (default sw)\n";
+	exit(0);
+    }
+    
+    # we are dealing with martians, so don't bother dropping them
+    # we make all routes explicit.
+    `echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter`;
+    if (!($ARGV[1] eq "hw")) {
+	if ($ARGV[1] eq "backend") {
+	    create_iptables_rx_existing_connection_chain(1);
+	} else {
+	    print "Running : ipset create ng.backends hash:ip\n";
+	    `ipset create ng.backends hash:ip`;
+	    create_iptables_rx_existing_connection_chain(0);
+	    print "Creating do not track rules\n";
+	    install_do_not_track_rules;
+	}
+    }
+    `sysctl -w net.ipv4.ip_forward=1`;
+    `echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter`;
+    if ($ARGV[1] eq "backend") {
+	`echo 1 > /proc/sys/net/ipv4/ip_nonlocal_bind`;
+    }
+} elsif ($command eq "uninit") {
+    if ($ARGV[1] eq "help") {
+	print "uninit\n";
+	exit(0);
+    }
+    destroy_iptables_rx_existing_connection_chain();
+    print "Running : ipset destroy ng.backends\n";
+    `ipset destroy ng.backends`;
+    destroy_do_not_track_rules;
+} elsif ($command eq "installroutes") {
+    if ($ARGV[1] eq "help") {
+	print "installroutes <ifname> <filename> (used for SWSW & HWSWITCH)\n";
+	exit(0);
+    }
+    my $ifname = $ARGV[1];
+    my $filename = $ARGV[2];
+    my $is_be = $ARGV[3]; # backend
+    parse_routing_config($ifname, $filename, $is_be);
+} elsif ($command eq "installberoutes") {
+    if ($ARGV[1] eq "help") {
+	print "installberoutes <ifname> <filename> (used for BE's only)\n";
+	exit(0);
+    }
+    if ($ARGV[1] eq "help") {
+	print "installberoutes <ifname> <filename>\n";
+	exit(0);
+    }
+    my $ifname = $ARGV[1];
+    my $filename = $ARGV[2];
+    parse_routing_config($ifname, $filename, 1);
+} elsif ($command eq "addecmp") {
+    if ($ARGV[1] eq "help") {
+	print "addecmp <ifname> <version/vlan> <prefix> <#outbound_sswitches> (HW only)\n";
+	exit(0);
+    }
+    my $prefix = $addr_arg;
+    my $ifcount = $ARGV[4];
+    ecmp_outbound("add", $if_name, $vlan_id, $prefix, $ifcount);  
+} elsif ($command eq "delecmp") {
+    if ($ARGV[1] eq "help") {
+	print "delecmp <ifname> <version/vlan> <prefix> <#outbound_sswitches> (HW only)\n";
+	exit(0);
+    }
+    my $prefix = $addr_arg;
+    my $ifcount = $ARGV[4];
+    ecmp_outbound("del", $if_name, $vlan_id, $prefix, $ifcount);  
+} elsif ($command eq "deleteversion") {
+    if ($ARGV[1] eq "help") {
+	print "deleteversion <ifname> <version/vlan>\n";
+	exit(0);
+    }
+    my @addresses = get_version_tunnel_addresses($vlan_id);
+    my @interfaces = get_version_tunnel_interfaces($vlan_id);
+    foreach (@addresses) {
+	my $addr = $_;
+	print "------ Delete version $vlan_id $addr\n";
+	destroy_gre_tunnel($vlan_id, $addr);
+	destroy_per_tunnel_tx_rule($vlan_id, $addr_arg);
+    }
+    print "------ Delete VLAN = $vlan_id\n";
+    destroy_vlan_routing_table($vlan_id);
+    destroy_vlan($if_name, $vlan_id);
+    foreach (@interfaces) {
+	my $iface = $_;
+	destroy_iptables_rx_chain($iface, $vlan_id);
+    }
+    destroy_iptables_rx_chain($if_name, $vlan_id);
+    print "------ Destroy Routing for $vlan_id\n";
+    destroy_vlan_routing_table($vlan_id);
+    foreach (@addresses) {
+	my $addr = $_;
+	my $table_name = get_tunnel_rt_table_name($vlan_id, $addr);
+	destroy_routing_table($vlan_id, $table_name);
+    }
+} elsif ($command eq "setupns") {
+    if ($ARGV[1] == "deleteversion") {
+	print "setupns <humanr_readable_vip_name> <vip>\n";
+	print "  use ip netns exect $command\n to run $command in the network"
+	    . "namespace.\n";
+	exit(0);
+    }
+    # used on the backend to create a namespace for the VIP
+    my $vip_name = $ARGV[1];
+    my $vip = $ARGV[2];
+    if ($vip_name eq "") {
+	print "VIP name must be provided\n";
+	exit (-1);
+    } 
+    if ($vip eq "") {
+	print "Must provide a vip for a namespace\n";
+	exit (-1);
+  }
+    setup_ns($vip_name, $vip);
+} elsif ($command eq "dumpversion") {
+    if ($ARGV[1] eq "help") {
+	print "dumpversion <ifname> <version/vlan>\n";
+	exit(0);
+    }
+    if ($vlan_id eq "") {
+	print "Usage showversion eth0 <version>\n";
+	exit(-1);
+    }
+    dump_version($vlan_id);
+} else {
+    print "Unknown command $command, possible values are are\n";
+    print "init: (ALL) initialize Niagara. Must be run!\n";
+    print "uninit: (ALL) remove Niagara\n";
+    print "addvlan : (HWSW and SSW only) adds a version-numbered VLAN interface\n";
+    print "delvlan : (HWSW and SSW only) removes a version-numbered VLAN interface\n";
+    print "addtunnel : (HWSW and SSW only) adds a versioned tunnel from SSW<->SSW or SSW<->HW\n";
+    print "detunnel : (HWSW and SSW only) removes a versioned tunnel from SSW<->SSW or SSW<->HW\n";
+    print "addbetunnel : (BE only) tunnel from the backend to the SSW\n";
+    print "delbetunnel : (BE only) inverse of add.\n";
+    print "addbackend : (SSW only) adds a backend to a SW switch.\n";
+    print "delbackend : (SSW only) inverse of add\n";
+    print "routevip: (TESTING HWSW and SSW) route a single VIP in a per-version"
+	. " default route.\n";
+    print "updatevipversion: (HWSW) updates the VIP version to be used for the "
+	. "routing of an incoming VIP.\n";
+    print "addecmp: (HW) use router ECMP to balance traffic for a VIP.\n";
+    print "delecmp: (HW) inverse of add\n";
+    print "installberoutes: (BE only) add routing configuration on the BE's\n"
+	. " to route SYN, FIN, RST back to the SSW.\n";
+    print "setupns : (BE only) create a ip namespace for a VIP so we can "
+	. "run services on the VIP within the namespace\n";
+    print "dumpversion : print all state configured for the given routing version\n";
+    print "installroutes : (SSW only) instal routings from a file\n";
+    print "installberoutes : (BE only) instal routings from a file to return SYN and fin to SSW\n";
+}
+

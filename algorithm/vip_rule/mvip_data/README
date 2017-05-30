@@ -1,0 +1,44 @@
+input weights:
+
+w8_a_100:
+8 weights, 
+100 vips
+a for pick_cluster + bimodel(G(4,1) + G(16,1) [ g for gaussian G(4,1) , b for bimodel G(4,1)+ G(16,1)]
+
+
+==============
+input traffic distribution:
+
+v300_zipf1k: 
+300 vips with zipf traffic skew. 1st / 300th = 1000 [1 for uniform, 300, 100k]
+
+
+==============
+packing result:
+
+w8_a_v300_zipf1k_out_heu: 
+heuristics, 8 weights(pick_cluster + bimodel), 300 vips, traffis skew 1st/300th = 1000, no ecmp rules
+
+
+w8_a_v300_zipf1k_out_ecmp_heu: 
+heuristics, 8 weights(pick_cluster + bimodel), 300 vips, traffis skew 1st/300th = 1000, default ecmp rules
+
+w8_a_v300_zipf1k_out_small_heu: 
+heuristics, 8 weights(pick_cluster + bimodel), 300 vips, traffis skew 1st/300th = 1000, no ecmp rules
+#rules is 300 + [10, 20, 30, 40]
+
+==============
+grouping result:
+
+w8_g_v10k_g100_zipf1k_out_heu:
+heuristics, 8 weights(gaussian), 10k vips, 100 groups, traffic skew 1st/300th = 1000, ecmp rules
+
+w8_b_v10k_g100_zipf1k_out_82k_heu:
+heuristics, 8 weights(gaussian), 10k vips, 100 groups, traffic skew 1st/300th = 1000, ecmp rules
+#rules is 8/2k
+
+==============
+max(error - eps, 0.0) result:
+
+w128_b_v100_g10_zipf300_out_prime_heu:
+heuristics, 128 weights(bimodel), 100 vips, 10 groups, traffic skew 1st / 300th = 300, ecmp rules, calculate imabalance as sum(sum(max(v - w - eps, 0.0)) * tr)

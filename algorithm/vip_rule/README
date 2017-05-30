@@ -1,0 +1,698 @@
+Running simulation
+
+python main.py
+-mode : single_vip, vip_stair, multi_vip, grouping, update
+-input: vip weight input file
+-output: performance summary output file. It is a .csv formatted table.
+-traffic: vip traffic volume input file
+-error: the tolerable error, default = 0.01
+-churn: the tolerable churn for each step in updating, default = 0.1
+-group: number of groups, default = 100
+-debug: debugging output file, including rule list, default = "debug.txt"
+-ecmp: default ecmp rules setting, 
+  1. "max" means using the nearest power of 2 number of ECMP rules, 
+  2. "all" means try all posible default ECMP rules, 
+  3. "none" means no default ECMP rules,
+  4. an integer M means using M ECMP rules (M = 2^k)
+  default is "max"
+-heu, -bf: use heuristics or brute force, default is brute force
+
+
+Next, we explain how to run different mode.
+(* The detailed explanation of input format are discussed afterwards.
+We first assume the input are already there)
+
+
+1. Single VIP rule generation
+
+run
+  python main.py -input $input.txt -output $output.csv -mode single_vip
+[-traffic] [-error] [-group] [-debug] [-ecmp] [-heu | -bf]
+
+
+An example is:
+
++++++input.txt+++++
+
+l 1
+4 0.001
+0.3 0.2 0.4 0.1
+
+
++++++output.csv+++++
+
+vip_index, #rules, #ECMP rules, error, weights
+0, 11, 4, 0.001, 0.3;0.2;0.4;0.1
+
+++++++debug.txt++++++
+idx = 0
+weights = [(0, 0.3), (1, 0.2), (2, 0.4), (3, 0.1)], error = 0.001
+approximations = [(0, 0.04999999999999999, 0.05078125, [(1, 5), (1, 6), (1, 8)]), (1, -0.04999999999999999, -0.05078125, [(-1, 5), (-1, 6), (-1, 8)]), (3, -0.15, -0.150390625, [(-1, 3), (-1, 6), (-1, 7), (-1, 9)])]
+#rules = 11 (ECMP = 4)
+p:*************00, c:0
+p:*************01, c:1
+p:*************10, c:2
+p:*************11, c:3
+p:0************11, c:2
+p:000**********01, c:0
+p:1000*********11, c:2
+p:0010*********01, c:0
+p:10010********11, c:2
+p:001100*******01, c:0
+p:1001100******11, c:2
+------------
+
+
+++++++++++++++++++++
+
+output.csv:
+For the first testcase (0.3, 0.2, 0.4, 0.1), it needs 11 rules (including 4 ECMP rules) to achieve tolerable error = 0.001.
+
+debug.txt:
+It output the detailed rule list
+
+
+
+
+2. VIP Stair Curve
+
+run
+  python main.py -input $input.txt -output $output.csv -mode vip_stair [-traffic] [-error] [-group] [-debug] [-ecmp] [-heu | -bf]
+
+An example is:
+
++++++input.txt+++++
+
+l 1
+4 0.001
+0.3 0.2 0.4 0.1
+
+
++++++output.csv+++++
+
+vip_index, #ECMP rules, error, #hw_rules, imbalance, #sw_rules
+0, 4, 0.15, 4, 0.4, 7
+0, 4, 0.05, 5, 0.15, 6
+0, 4, 0.025, 6, 0.075, 5
+0, 4, 0.0125, 7, 0.0375, 4
+0, 4, 0.00625, 8, 0.01875, 3
+0, 4, 0.003125, 9, 0.009375, 2
+0, 4, 0.0015625, 10, 0.0046875, 1
+0, 4, 0.00078125, 11, 0.00234375, 0
+0, 4, 0.000390625, 12, 0.001171875, 0
+
+
+++++++debug.txt++++++
+idx = 0
+weights = [(0, 0.3), (1, 0.2), (2, 0.4), (3, 0.1)]
+root_approximations = [(0, 0.04999999999999999, 0.0, []), (1, -0.04999999999999999, -0.0, []), (3, -0.15, -0.0, [])]
+error = 0.15, imbalance = 0.4
+#root_rules = 4 (ECMP = 4)
+p:*************00, c:0
+p:*************01, c:1
+p:*************10, c:2
+p:*************11, c:3
+#leaf_rules = 7
+p:0************11, c:2
+p:000**********01, c:0
+p:1000*********11, c:2
+p:0010*********01, c:0
+p:10010********11, c:2
+p:001100*******01, c:0
+p:1001100******11, c:2
+------------
+idx = 0
+
+....(omitted)
+
+
++++++++++++++++++++++
+
+
+output.csv plots the relationship of #hw_rules, #sw_rules, max_weight_error and imbalance.
+For weights (0.3, 0.2, 0.4, 0.1), the third line say, 5 rules (with 4 ECMP rules), we can achieve:
+- total imbalance = 0.15 (sum |w'_i - w_i|)
+- the max error per weight is 0.05
+- an extra 7 rules are needed to achieve tolerable_error = 0.001
+
+debug.txt shows the rules for each line in the output.csv
+
+
+3. Update a single VIP
+
+run
+  python main.py -input $input.txt -output $output.csv -mode update
+[-traffic] [-error] [-group] [-debug] [-ecmp] [-heu | -bf]
+
+An example is 
+
++++++input.txt+++++
+l 2
+4 0.01
+0.2 0.4 0.1 0.3
+4 0.01 
+0.33 0.11 0.24 0.32
+
+
++++++output.csv+++++
+
+index, #ECMP rules, #old_rules, #joint_rules, #new_rules, churn, #steps
+0, 4, 8, 8, 12, 0.296875, 5
+0, 4, 8, 7, 11, 0.3046875, 4
+0, 4, 8, 6, 9, 0.4296875, 5
+0, 4, 8, 5, 9, 0.4609375, 6
+0, 4, 8, 4, 7, 0.3046875, 4
+
++++++debug.txt+++++
+StepFile = debug_update.txt.step
+idx = 0
+old_weights = [(0, 0.2), (1, 0.4), (2, 0.1), (3, 0.3)]
+old_error = 0.01
+new_weights = [(0, 0.33), (1, 0.11), (2, 0.24), (3, 0.32)]
+new_error = 0.01
+#old_rules = 8 (ECMP = 4))
+p:*************00, c:0
+p:*************01, c:1
+p:*************10, c:2
+p:*************11, c:3
+p:0************10, c:1
+p:00***********00, c:3
+p:100**********10, c:1
+p:00000********11, c:0
+------------
+idx = 0
+
+.... omitted
+
++++++debug.txt.step+++++
+idx = 0
+#new_rules = 12 (#joint_rules = 8)
+#steps = 5
+Step 0
+p:*************00, c:0
+p:*************01, c:1
+p:*************10, c:2
+p:*************11, c:3
+p:0************10, c:1
+p:00***********00, c:3
+p:01***********00, c:0
+p:01***********11, c:3
+p:01***********10, c:1
+p:01***********01, c:0
+p:100**********10, c:1
+p:00000********11, c:0
+===============
+Step 1
+p:*************00, c:0
+p:*************01, c:1
+p:*************10, c:2
+p:*************11, c:3
+p:0************10, c:1
+p:0************00, c:0
+p:0************01, c:0
+p:01***********11, c:3
+p:01***********10, c:1
+p:00***********00, c:3
+p:100**********10, c:1
+p:00000********11, c:0
+===============
+Step 2
+
+....omitted
+
+
+The input requires an even number of VIP weights. The code computes
+update from the 1st weights to 2nd weights, 3rd to 4th, ...
+
+
+In output.csv, each line shows the data for one fixed #joint rules.
+For example, the second line shows that the old weights need 8 rules (3rd column),
+and if we keep all those 8 rules(4th column) then we need 12 rules to approximate the new weight. The corresponding churn is 0.296875. And if decrease #joint rules to 4, then we end up with 7 rules, but churn only increases to 0.3046875, All these data are computed with 4 ECMP default rules. 
+With the tolerable churn per step = 0.1, each case needs 5, 4 steps respectively.
+
+In debug.txt, we output the old rules and new rules for each fixed #joint rules.
+At the top of the file is the filename of the step file, which includes the rules installed for each step.
+
+
+4. Multiple VIPs rule generation
+
+run
+  python main.py -input $input.txt -output $output.csv -traffic traffic.txt -mode multi_vip  [-error] [-group] [-debug] [-ecmp] [-heu | -bf]
+
+An example is:
+
++++++input.txt+++++
+
+m 5 3 5 10 15 20
+0.21 0.14 0.33 0.11 0.21 
+0.15 0.18 0.42 0.05 0.2 
+0.1 0.14 0.4 0.12 0.24
+
++++++traffic.txt+++++
+1
+0.3 0.3 0.4
+
+
++++++output.csv+++++
+traffic_index, #ECMP rules, error, #hw_rules, imbalance, #sw_rules
+0, 4, 0.01, 5, 0.596, 3, 5, 0, 8, 1
+0, 4, 0.01, 10, 0.203, 3, 3, 0, 1, 4
+0, 4, 0.01, 15, 0.0725, 0, 0, 1, 2, 3
+0, 4, 0.01, 20, 0.029375, 0, 1, 0, 0, 1
+
++++++debug.txt+++++
+
+traffic_idx = 0, error = 0.01
+imbalance = 0.596
+#root_rules = 5 (4 ECMP rules)
+p:*************00, c:0, vip:0
+p:*************01, c:1, vip:0
+p:*************10, c:2, vip:0
+p:*************11, c:3, vip:0
+p:*************00, c:4, vip:2
+#leaf_rules = 3, for switch 0
+p:000**********00, c:4, vip:0
+p:00***********00, c:4, vip:1
+p:010**********00, c:2, vip:1
+#leaf_rules = 5, for switch 1
+p:0************01, c:4, vip:0
+p:00***********01, c:4, vip:1
+p:01000********01, c:2, vip:1
+p:0************01, c:0, vip:2
+p:0000*********01, c:1, vip:2
+#leaf_rules = 0, for switch 2
+
+#leaf_rules = 8, for switch 3
+p:0************11, c:4, vip:0
+p:00***********11, c:2, vip:0
+p:1000*********11, c:2, vip:0
+
+.... omitted
+
+
+
+The input specifies the weight distributions of 3 VIPs over 5 Clusters and 1 set of traffic volume distributions of VIPs.
+It requires running over $hw_rule capacity = 5, 10, 20
+
+In output.csv, each line shows the data for one fixed #hw_rule capacity.
+For example, the second line shows that with 5 hw_rules (including 4 ECMP rules),
+we can achieve imbalance = 0.596 (sum |w'_ij - w_ij| * v_i), with 3, 5, 0, 8 and 1 rules installed on 5 software switches respectively.
+
+In debug.txt, it shows the detailed rule list for each fixed #hw_rule capacity.
+
+
+
+5. Grouping
+
+
+
+run
+  python main.py -input $input.txt -output $output.csv -traffic traffic.txt -mode grouping -group [-error] [-debug] [-ecmp] [-heu | -bf]
+
+An example is:
+
++++++input.txt+++++
+
+m 5 3 5 10 15 20
+0.21 0.14 0.33 0.11 0.21 
+0.15 0.18 0.42 0.05 0.2 
+0.1 0.14 0.4 0.12 0.24
+
++++++traffic.txt+++++
+1
+0.3 0.3 0.4
+
+
++++++output.csv+++++
+traffic_index, #ECMP rules, error, #groups, #hw_rules, imbalances
+0, 4, 0.01, 2, 5, 0.4835 
+0, 4, 0.01, 2, 10, 0.128 
+0, 4, 0.01, 2, 15, 0.08190625 
+0, 4, 0.01, 2, 20, 0.08 
+
++++++debug.txt+++++
+group_vips_filename = debug.txt.vips
+group_traffic_filename = debug.txt.traffic
+VIP 0 belongs to Group 1
+VIP 1 belongs to Group 0
+VIP 2 belongs to Group 0
+=========ending testcase 0=========
+
+The input specifies the weight distributions of 3 VIPs over 5 Clusters and 1 set of traffic volume distributions of VIPs.
+It requires running over $hw_rule capacity = 5, 10, 20
+The fixed #group is 2.
+
+The output 
+In output.csv, each line shows the data for one fixed #hw_rule capacity after grouping.
+For example, the second line shows that with 5 hw_rules (including 4 ECMP rules),
+we can achieve imbalance = 0.4835 (sum |w'_{group[i] j} - w_ij| * v_i), where VIP i belongs to group i.
+
+In debug.txt, it shows the grouping information.
+The first two line shows the file storing weights and traffic volume of each group.
+Next, it shows the group each VIP belongs too. For example, VIP 0 belongs to Group 1.
+
+The corresponding debug files are shown below:
+
++++++debug.txt.vips+++++
+m 5 2 5 10 15 20
+0.121428571429 0.157142857143 0.408571428571 0.09 0.222857142857
+0.21 0.14 0.33 0.11 0.21
+=========ending testcase 0=========
+
++++++debug.txt.traffic+++++
+1
+0.7 0.3
+=========ending testcase 0=========
+
+
+
+
+
+
+
+Input File Format
+
+>>>>>> -input for single_vip and vip_stair >>>>>>>>>>>>>>>>>
+
+The file looks like the following:
+l $ntests
+$nweights[0] $error[0]
+$w[0] .. $w[nweights[0] - 1]
+...
+$nweights[ntests] $error[$ntests - 1]
+...
+
+=========
+Explanation:
+
+There are $ntests testcases, each testcase is only 1 vip.
+Each two lines specify one testcase: 
+the first line shows the number of weights and the tolerable error
+the second line shows the weights
+
+==========
+Sample input.txt
+
+l 1
+4 0.001
+0.21 0.26 0.29 0.24
+
+EOF
+
+There is 1 testcase, where there are 4 weights. The tolerable error is 0.001.
+=========
+
+
+
+
+>>>>>> -input for multi_vip and grouping >>>>>>>>>>>>>>>>>
+
+The file looks like the following:
+
+m $clusters $vips $C[0] .. $C[clen]
+$w[0][0] .. $w[0][$clusters - 1]
+...
+$w[$vips-1][0] .. $w[$vips-1][$clusters - 1]
+
+=========
+Explanation:
+
+There are $clusters clusters, and $vips vips.
+We want to test the case with different #hardware rules: C[0],.. C[clen]
+Next, each line specify one vip
+
+==========
+Sample input_weight.txt
+
+m 5 3 10
+0.21 0.14 0.33 0.11 0.21
+0.15 0.18 0.42 0.05 0.2
+0.1 0.14 0.4 0.12 0.24
+
+EOF
+
+There are 5 clusters and 3 VIPs. The hardware rules is 10.
+Each line specify one VIP.
+
+
+
+
+>>>>>> -traffic for multi_vip and grouping >>>>>>>>>>>>>>>>>
+
+The file looks like the following:
+
+>>>>>>>>>>>>>>>>>
+The format of traffict looks like the following:
+
+$tests
+$v[0][0] .. $v[0][$vips -1]
+...
+$v[$tests-1][0] .. $w[$tests-1][$vips-1]
+
+
+=========
+Explanation:
+
+There are $tests sets of traffic distributions to test.
+Each line shows one distribution.
+
+==========
+Sample input_traffic.txt
+
+1
+0.3 0.3 0.4
+
+
+EOF
+
+There is 1 set of traffic distribution: 0.3, 0.3, 0.4
+
+
+
+
+
+
+
+
+>>>>>>>>>>>>>>>>>
+The program writes to output.csv
+In output.csv, it outputs the following information for each i-th tests:
+
+i, #rules_NON_ECMP, ..., #rules([log(n[i]))]-bit-ECMP, |, n[i], w[0], ..., w_[n[i]-1], e[i]
+
+==========
+Sample output.csv
+
+0, 8, 7, 6, 4, |, 4, 0.21, 0.26, 0.29, 0.24, 0.001
+
+===========
+
+Explanation of output.csv
+
+i, #rules_NON_ECMP,  #rules_0-bit_ECMP, #rules_1-bit_ECMP, #rules_2-bit_ECMP, |, n[i], w[0], ..., w_[4], e[i]
+0, 8, 7, 6, 4, |, 4, 0.21, 0.26, 0.29, 0.24, 0.001
+
+- no default rule, it needs 8 rules
+- 0-bit ECMP default rules(default rules send all traffic to cluster 0), it needs 7 non-default rules
+- 1-bit ECMP default rules(default rules split traffic evenly to cluter 0 and 1), it needs 6 non-default rules
+- 2-bit ECMP default rules(default rules split traffic to cluster 0 - 3), it needs 4 non-default rules
+
+
+--------------------------------------------------
+
+2. Multiple VIPs
+
+run
+  python main.py m $input_weight.txt $output.csv $traffic.txt
+
+
+The program writes to $output.csv
+In output.csv, it outputs the following information for each i-th tests:
+
+i, c[j], imb_NON_ECMP, ..., imb_([log($clusters))]-bit-ECMP
+
+==========
+Sample output.csv
+
+
+0, 10, 0.362, 0.245, 0.236, 0.1295
+
+===========
+
+Explanation of output.csv
+
+i, c[j], imb_NON_ECMP, imb_0-bit_ECMP, imb_1-bit_ECMP, imb_2-bit_ECMP
+0, 10, 0.362, 0.245, 0.236, 0.1295
+
+
+With 10 rules in total,
+- no default rule, it achieves 36.2% total imbalance
+- 0-bit ECMP default rules(default rules send all traffic to cluster 0), it achieves 24.5% total imbalance
+- 1-bit ECMP default rules(default rules split traffic evenly to cluter 0 and 1), it achieves 23.6% total imbalance
+- 2-bit ECMP default rules(default rules split traffic to cluster 0 - 3), it achives 12.95% imbalance
+
+
+
+--------------------------------------------------
+
+3. Switch Tree
+
+run
+  python main.py m $input_weight.txt $output.csv $traffic.txt $tolerable_error
+
+
+$tolerable_error denotes how SW rules should be generated to fix imbalance.
+Assuming $tolerable_error = 0.001
+
+>>>>>>>>>>>>>>>>>
+Input files $input_weight.txt and $traffic.txt are in the same format with Multiple VIPs. 
+
+
+>>>>>>>>>>>>>>>>>
+The format of $input_weight.txt looks like the following:
+
+m $clusters $vips $C[0] .. $C[clen]
+$w[0][0] .. $w[0][$clusters - 1]
+...
+$w[$vips-1][0] .. $w[$vips-1][$clusters - 1]
+
+==========
+Sample input_weight.txt
+
+m 5 3 10
+0.21 0.14 0.33 0.11 0.21
+0.15 0.18 0.42 0.05 0.2
+0.1 0.14 0.4 0.12 0.24
+
+
+>>>>>>>>>>>>>>>>>
+The format of $input_traffic.txt looks like the following:
+
+$tests
+$v[0][0] .. $v[0][$vips -1]
+...
+$v[$tests-1][0] .. $w[$tests-1][$vips-1]
+
+==========
+Sample input_traffic.txt
+
+1
+0.3 0.3 0.4
+
+
+>>>>>>>>>>>>>>>>>
+
+The program writes to $output.csv
+In output.csv, it outputs the following information for each i-th tests:
+
+i, root_rules[j], leaf_rules[0], ..., leaf_rules[$clusters - 1]
+
+==========
+Sample output.csv
+
+
+0, 10, 5, 3, 2, 5, 5
+
+===========
+
+Explanation of output.csv
+
+i, #root_rules, leaf_rules[0], ..., leaf_rules[4]
+0, 10, 5, 3, 2, 5, 5
+
+
+With 10 rules in the root, to achieve tolerable_error = 0.001,
+we need to install 5 rules in the first software switch, 3,2,5,5 rules for the other 4 software switches respectively.
+
+
+--------------------------------------------------
+
+4. Grouping
+
+run
+  python main.py m $input_weight.txt $output.csv $traffic.txt $num_groups
+
+
+$num_groups denotes the number of VIP groups we want to form.
+Assuming $num_groups = 2 for the sample test case
+
+>>>>>>>>>>>>>>>>>
+Input files $input_weight.txt and $traffic.txt are in the same format with Multiple VIPs. 
+
+
+>>>>>>>>>>>>>>>>>
+The format of $input_weight.txt looks like the following:
+
+m $clusters $vips $C[0] .. $C[clen]
+$w[0][0] .. $w[0][$clusters - 1]
+...
+$w[$vips-1][0] .. $w[$vips-1][$clusters - 1]
+
+==========
+Sample input_weight.txt
+
+m 5 3 10
+0.21 0.14 0.33 0.11 0.21
+0.15 0.18 0.42 0.05 0.2
+0.1 0.14 0.4 0.12 0.24
+
+
+>>>>>>>>>>>>>>>>>
+The format of $input_traffic.txt looks like the following:
+
+$tests
+$v[0][0] .. $v[0][$vips -1]
+...
+$v[$tests-1][0] .. $w[$tests-1][$vips-1]
+
+==========
+Sample input_traffic.txt
+
+1
+0.3 0.3 0.4
+
+
+>>>>>>>>>>>>>>>>>
+
+The program writes to $output.csv
+In output.csv, it outputs the following information for each i-th tests:
+
+i, #rules, imbalance
+
+==========
+Sample output.csv
+
+0, 5, 0.4835
+
+===========
+
+Explanation of output.csv
+
+i, #rules, imbalance
+0, 10, 0.128
+
+
+With 10 hw rules and grouping VIPs into 2 groups, we can achieve imbalance = 0.128
+
+
+
+
+
+5. Testcase generator
+
+- Generate weights for single vip
+
+  python random_input.py l $output_file $n_tests $n_weights $tolerable_error
+
+- Generate weights for multiple vips
+
+ python random_input.py m $output_file $n_vips $n_weights $mode
+
+- Generate randomized traffic pattern
+
+ python random_input.py randt $output_file $n_tests $n_vips
+
+- Generate zipf-shaped traffic pattern
+
+ python random_input.py zipf $output_file $n_tests $n_vips
+

@@ -1,0 +1,11 @@
+- ecmp_bad_xmin.csv / ng_bac_xmin.csv:
+the imbalance of servers in each x min time frame:
+
+- niagara_input, niagara_bad_input and niagara_output:
+the input and output to niagara algorithm
+ (niagara_bad_input and niagara_output produces 1min and 2min imbalance)
+ (niagara_input produces 5min imbalance)
+
+- bad_minute.csv merges all *_bad_*min.csv
+
+- trace_bad.csv contains the trace of the example DIP (Which ECMP performs bad)

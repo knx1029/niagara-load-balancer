@@ -1,0 +1,20 @@
+Controller Exe
+
+- ng-setupall.sh
+  . configure all HW, SW and BEs
+  . Supported operations:
+    + connsw, disconnsw: create/destroy tunnels between HW and SW with given vtag
+    + addbe, delbe: create/destroy tunnels between SW and BE
+    + installroutes, installberoutes: install rules on HW,SW and BEs
+    + updatevipversion: update the version on HW
+  . dump debugging information to Log files
+  . implemented by calling ng-setup.py on hosts
+
+Local Exe (@ host)
+
+- ng-setup.py
+  . local configuration ona single host
+  . implemented by calling ng-vlan
+
+- ng-vlan
+  . does step-by-step operation on iptables, route table, ifconfig
